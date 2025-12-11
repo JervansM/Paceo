@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "438040446232",
+    "project_id": "flutterdbmontero",
+    "storage_bucket": "flutterdbmontero.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:438040446232:android:787cc9fdc3e10b4c74ca6d",
+        "android_client_info": {
+          "package_name": "com.example.paceo"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBLYE8pAuCCCmZLGf6vgjTMeaZdeIg0m8I"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
