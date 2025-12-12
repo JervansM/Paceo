@@ -7,9 +7,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:intl/intl.dart';
 
-
 import 'dashboard.dart';
-
 
 // ---------------------------------------------------------------------------
 // WORKOUT PAGE - MAIN ENTRY
@@ -45,9 +43,13 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
   bool _isWorkoutActive = false;
   Duration _workoutDuration = Duration.zero;
   DateTime? _workoutStartTime;
+  String? _activeSessionId;
   
   // Timer for active workout
   late Timer _workoutTimer;
+  
+  // Track exercise completion during active workout
+  Map<int, bool> _exerciseCompletion = {};
 
   @override
   void initState() {
@@ -91,7 +93,7 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
 
       _workoutHistory = historySnapshot.docs.map((doc) {
         final data = doc.data();
-        return WorkoutSession.fromMap(data);
+        return WorkoutSession.fromMap(data, doc.id);
       }).toList();
 
       // Set today's workout if not set
@@ -122,12 +124,21 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
         .get();
 
     if (activeSession.docs.isNotEmpty) {
-      final data = activeSession.docs.first.data();
+      final doc = activeSession.docs.first;
+      final data = doc.data();
       final startTime = (data['startTime'] as Timestamp).toDate();
+      final exercises = data['exercises'] as List<dynamic>? ?? [];
+      
+      // Track exercise completion from Firestore
+      for (int i = 0; i < exercises.length; i++) {
+        _exerciseCompletion[i] = exercises[i]['completed'] ?? false;
+      }
+      
       setState(() {
         _isWorkoutActive = true;
         _workoutStartTime = startTime;
         _workoutDuration = DateTime.now().difference(startTime);
+        _activeSessionId = doc.id;
       });
       
       // Start timer
@@ -152,24 +163,33 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
       _isWorkoutActive = true;
       _workoutStartTime = DateTime.now();
       _workoutDuration = Duration.zero;
+      // Reset exercise completion tracking
+      _exerciseCompletion.clear();
     });
 
     _startWorkoutTimer();
 
     // Create workout session in Firestore
-    await firestore.collection('workout_sessions').add({
+    final sessionData = {
       'userId': user!.uid,
       'workoutPlanId': _activeWorkout!.id,
       'workoutPlanName': _activeWorkout!.name,
       'startTime': Timestamp.now(),
       'date': DateFormat('yyyy-MM-dd').format(DateTime.now()),
+      'dateTime': Timestamp.now(), // For ordering
       'isActive': true,
+      'completed': false,
       'exercises': _activeWorkout!.exercises.map((e) => e.toMap()).toList(),
+    };
+
+    final docRef = await firestore.collection('workout_sessions').add(sessionData);
+    setState(() {
+      _activeSessionId = docRef.id;
     });
   }
 
   Future<void> _completeWorkout() async {
-    if (user == null) return;
+    if (user == null || _activeSessionId == null) return;
 
     setState(() {
       _isWorkoutActive = false;
@@ -177,26 +197,51 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
 
     _workoutTimer.cancel();
 
-    // Update active session
-    final activeSession = await firestore
-        .collection('workout_sessions')
-        .where('userId', isEqualTo: user!.uid)
-        .where('isActive', isEqualTo: true)
-        .limit(1)
-        .get();
-
-    if (activeSession.docs.isNotEmpty) {
-      final sessionDoc = activeSession.docs.first;
-      final durationInSeconds = _workoutDuration.inSeconds;
-      
-      await sessionDoc.reference.update({
-        'endTime': Timestamp.now(),
-        'duration': durationInSeconds,
-        'isActive': false,
-        'completed': true,
-        'caloriesBurned': _calculateCaloriesBurned(durationInSeconds),
-      });
+    // Update exercises with completion status
+    final updatedExercises = <Map<String, dynamic>>[];
+    if (_activeWorkout != null) {
+      for (int i = 0; i < _activeWorkout!.exercises.length; i++) {
+        final exercise = _activeWorkout!.exercises[i];
+        updatedExercises.add({
+          'name': exercise.name,
+          'sets': exercise.sets,
+          'reps': exercise.reps,
+          'duration': exercise.duration,
+          'completed': _exerciseCompletion[i] ?? false,
+        });
+      }
     }
+
+    final durationInSeconds = _workoutDuration.inSeconds;
+    final caloriesBurned = _calculateCaloriesBurned(durationInSeconds);
+    
+    // Update active session
+    await firestore.collection('workout_sessions').doc(_activeSessionId!).update({
+      'endTime': Timestamp.now(),
+      'duration': durationInSeconds,
+      'isActive': false,
+      'completed': true,
+      'caloriesBurned': caloriesBurned,
+      'exercises': updatedExercises,
+    });
+
+    // Create local session for history
+    final newSession = WorkoutSession(
+      id: _activeSessionId!,
+      workoutPlanId: _activeWorkout?.id ?? '',
+      workoutPlanName: _activeWorkout?.name ?? 'Unknown Workout',
+      date: DateFormat('yyyy-MM-dd').format(DateTime.now()),
+      duration: durationInSeconds,
+      caloriesBurned: caloriesBurned,
+      exercises: _activeWorkout?.exercises ?? [],
+      isCompleted: true,
+    );
+
+    setState(() {
+      _workoutHistory.insert(0, newSession);
+      _activeSessionId = null;
+      _exerciseCompletion.clear();
+    });
 
     // Reload data
     await _loadWorkoutData();
@@ -209,6 +254,45 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
     );
   }
 
+  Future<void> _markExerciseComplete(int index, bool value) async {
+    if (!_isWorkoutActive || _activeSessionId == null) return;
+
+    setState(() {
+      _exerciseCompletion[index] = value;
+    });
+
+    // Update in Firestore
+    if (_activeWorkout != null && index < _activeWorkout!.exercises.length) {
+      final exercises = _activeWorkout!.exercises.map((e) => e.toMap()).toList();
+      exercises[index]['completed'] = value;
+      
+      await firestore.collection('workout_sessions').doc(_activeSessionId!).update({
+        'exercises': exercises,
+      });
+    }
+  }
+
+  Future<void> _markAllExercisesComplete() async {
+    if (!_isWorkoutActive || _activeWorkout == null || _activeSessionId == null) return;
+
+    setState(() {
+      for (int i = 0; i < _activeWorkout!.exercises.length; i++) {
+        _exerciseCompletion[i] = true;
+      }
+    });
+
+    // Update in Firestore
+    final updatedExercises = _activeWorkout!.exercises.map((e) {
+      final map = e.toMap();
+      map['completed'] = true;
+      return map;
+    }).toList();
+    
+    await firestore.collection('workout_sessions').doc(_activeSessionId!).update({
+      'exercises': updatedExercises,
+    });
+  }
+
   int _calculateCaloriesBurned(int durationInSeconds) {
     // Simple calculation: ~5 calories per minute for moderate exercise
     return (durationInSeconds ~/ 60) * 5;
@@ -216,17 +300,29 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
 
   String _formatDuration(Duration duration) {
     String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final hours = twoDigits(duration.inHours);
     final minutes = twoDigits(duration.inMinutes.remainder(60));
     final seconds = twoDigits(duration.inSeconds.remainder(60));
-    return "$hours:$minutes:$seconds";
+    
+    if (duration.inHours > 0) {
+      final hours = twoDigits(duration.inHours);
+      return "$hours:$minutes:$seconds";
+    }
+    return "$minutes:$seconds";
+  }
+
+  double _getWorkoutProgress() {
+    if (_activeWorkout == null || _activeWorkout!.exercises.isEmpty) return 0.0;
+    
+    final totalExercises = _activeWorkout!.exercises.length;
+    final completedExercises = _exerciseCompletion.values.where((v) => v == true).length;
+    return completedExercises / totalExercises;
   }
 
   Future<void> _createNewWorkoutPlan() async {
     final nameController = TextEditingController();
     final descriptionController = TextEditingController();
 
-    await showDialog(
+    final result = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text("Create New Workout Plan"),
@@ -253,24 +349,13 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(context, false),
             child: const Text("Cancel"),
           ),
           ElevatedButton(
-            onPressed: () async {
-              if (nameController.text.isNotEmpty && user != null) {
-                await firestore.collection('workout_plans').add({
-                  'userId': user!.uid,
-                  'name': nameController.text,
-                  'description': descriptionController.text,
-                  'isActive': true,
-                  'exercises': [],
-                  'createdAt': Timestamp.now(),
-                  'updatedAt': Timestamp.now(),
-                });
-                
-                await _loadWorkoutData();
-                Navigator.pop(context);
+            onPressed: () {
+              if (nameController.text.trim().isNotEmpty) {
+                Navigator.pop(context, true);
               }
             },
             child: const Text("Create"),
@@ -278,6 +363,33 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
         ],
       ),
     );
+
+    if (result == true && nameController.text.trim().isNotEmpty && user != null) {
+      // Set all existing plans to inactive
+      for (final plan in _workoutPlans) {
+        await firestore.collection('workout_plans').doc(plan.id).update({
+          'isActive': false,
+        });
+      }
+
+      await firestore.collection('workout_plans').add({
+        'userId': user!.uid,
+        'name': nameController.text,
+        'description': descriptionController.text,
+        'isActive': true,
+        'exercises': [],
+        'createdAt': Timestamp.now(),
+        'updatedAt': Timestamp.now(),
+      });
+      
+      await _loadWorkoutData();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Workout plan '${nameController.text}' created!"),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
   }
 
   Future<void> _addExerciseToPlan(String planId) async {
@@ -286,7 +398,7 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
     final repsController = TextEditingController(text: "10");
     final durationController = TextEditingController(text: "60");
 
-    await showDialog(
+    final result = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text("Add Exercise"),
@@ -341,27 +453,13 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(context, false),
             child: const Text("Cancel"),
           ),
           ElevatedButton(
-            onPressed: () async {
-              if (nameController.text.isNotEmpty) {
-                final exercise = {
-                  'name': nameController.text,
-                  'sets': int.tryParse(setsController.text) ?? 3,
-                  'reps': int.tryParse(repsController.text) ?? 10,
-                  'duration': int.tryParse(durationController.text) ?? 60,
-                  'completed': false,
-                };
-
-                await firestore.collection('workout_plans').doc(planId).update({
-                  'exercises': FieldValue.arrayUnion([exercise]),
-                  'updatedAt': Timestamp.now(),
-                });
-
-                await _loadWorkoutData();
-                Navigator.pop(context);
+            onPressed: () {
+              if (nameController.text.trim().isNotEmpty) {
+                Navigator.pop(context, true);
               }
             },
             child: const Text("Add"),
@@ -369,6 +467,241 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
         ],
       ),
     );
+
+    if (result == true && nameController.text.trim().isNotEmpty) {
+      final exercise = {
+        'name': nameController.text,
+        'sets': int.tryParse(setsController.text) ?? 3,
+        'reps': int.tryParse(repsController.text) ?? 10,
+        'duration': int.tryParse(durationController.text) ?? 60,
+        'completed': false,
+      };
+
+      await firestore.collection('workout_plans').doc(planId).update({
+        'exercises': FieldValue.arrayUnion([exercise]),
+        'updatedAt': Timestamp.now(),
+      });
+
+      await _loadWorkoutData();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text("Exercise '${nameController.text}' added!"),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
+  }
+
+  Future<void> _editExercise(String planId, Exercise exercise, int index) async {
+    final nameController = TextEditingController(text: exercise.name);
+    final setsController = TextEditingController(text: exercise.sets.toString());
+    final repsController = TextEditingController(text: exercise.reps.toString());
+    final durationController = TextEditingController(text: exercise.duration.toString());
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Edit Exercise"),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: nameController,
+                decoration: const InputDecoration(
+                  labelText: "Exercise Name",
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 15),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: setsController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: "Sets",
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: TextField(
+                      controller: repsController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: "Reps",
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 15),
+              TextField(
+                controller: durationController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: "Duration (seconds)",
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Cancel"),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              if (nameController.text.trim().isNotEmpty) {
+                Navigator.pop(context, true);
+              }
+            },
+            child: const Text("Save"),
+          ),
+        ],
+      ),
+    );
+
+    if (result == true && nameController.text.trim().isNotEmpty) {
+      // Get current plan and exercises
+      final planDoc = await firestore.collection('workout_plans').doc(planId).get();
+      final planData = planDoc.data();
+      if (planData != null) {
+        final exercises = List<Map<String, dynamic>>.from(planData['exercises'] ?? []);
+        
+        if (index < exercises.length) {
+          exercises[index] = {
+            'name': nameController.text,
+            'sets': int.tryParse(setsController.text) ?? exercise.sets,
+            'reps': int.tryParse(repsController.text) ?? exercise.reps,
+            'duration': int.tryParse(durationController.text) ?? exercise.duration,
+            'completed': exercise.completed,
+          };
+
+          await firestore.collection('workout_plans').doc(planId).update({
+            'exercises': exercises,
+            'updatedAt': Timestamp.now(),
+          });
+
+          await _loadWorkoutData();
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Exercise updated!"),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> _deleteExercise(String planId, int index) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Delete Exercise"),
+        content: const Text("Are you sure you want to delete this exercise?"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Cancel"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+            ),
+            child: const Text("Delete"),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    // Get current plan and exercises
+    final planDoc = await firestore.collection('workout_plans').doc(planId).get();
+    final planData = planDoc.data();
+    if (planData != null) {
+      final exercises = List<Map<String, dynamic>>.from(planData['exercises'] ?? []);
+      
+      if (index < exercises.length) {
+        exercises.removeAt(index);
+
+        await firestore.collection('workout_plans').doc(planId).update({
+          'exercises': exercises,
+          'updatedAt': Timestamp.now(),
+        });
+
+        await _loadWorkoutData();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("Exercise deleted!"),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _setActivePlan(WorkoutPlan plan) async {
+    // Set all plans to inactive first
+    for (final p in _workoutPlans) {
+      await firestore.collection('workout_plans').doc(p.id).update({
+        'isActive': p.id == plan.id,
+      });
+    }
+
+    setState(() {
+      _activeWorkout = plan;
+    });
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text("${plan.name} is now your active workout"),
+        backgroundColor: Colors.green,
+      ),
+    );
+  }
+
+  Future<void> _deleteWorkoutPlan(String planId) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Delete Workout Plan"),
+        content: const Text("Are you sure you want to delete this workout plan?"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Cancel"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red,
+            ),
+            child: const Text("Delete"),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await firestore.collection('workout_plans').doc(planId).delete();
+      await _loadWorkoutData();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Workout plan deleted"),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
   }
 
   @override
@@ -449,8 +782,12 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
   }
 
   Widget _buildTodayWorkout() {
+    // Make sure we have an active workout selected
     if (_activeWorkout == null && _workoutPlans.isNotEmpty) {
-      _activeWorkout = _workoutPlans.first;
+      _activeWorkout = _workoutPlans.firstWhere(
+        (plan) => plan.isActive,
+        orElse: () => _workoutPlans.first,
+      );
     }
 
     return SingleChildScrollView(
@@ -478,11 +815,15 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      _activeWorkout?.name ?? "No Active Workout",
-                      style: GoogleFonts.poppins(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w600,
+                    Expanded(
+                      child: Text(
+                        _activeWorkout?.name ?? "No Active Workout",
+                        style: GoogleFonts.poppins(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                     if (_activeWorkout != null)
@@ -538,6 +879,25 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                             color: Colors.green,
                           ),
                         ),
+                        const SizedBox(height: 10),
+                        LinearProgressIndicator(
+                          value: _getWorkoutProgress(),
+                          backgroundColor: Colors.grey.shade200,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            _getWorkoutProgress() > 0.7 
+                              ? Colors.green 
+                              : const Color(0xFF9E1818),
+                          ),
+                          minHeight: 8,
+                        ),
+                        const SizedBox(height: 5),
+                        Text(
+                          "${(_getWorkoutProgress() * 100).toStringAsFixed(0)}% Complete",
+                          style: GoogleFonts.poppins(
+                            fontSize: 12,
+                            color: Colors.grey.shade600,
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -561,7 +921,7 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                           ),
                           const SizedBox(height: 5),
                           Text(
-                            "Tap to start",
+                            "${_activeWorkout!.exercises.length} exercises",
                             style: GoogleFonts.poppins(
                               fontSize: 14,
                               color: Colors.grey,
@@ -610,13 +970,27 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
           // Exercises List
           if (_activeWorkout != null && _activeWorkout!.exercises.isNotEmpty) ...[
             const SizedBox(height: 20),
-            Text(
-              "Exercises",
-              style: GoogleFonts.poppins(
-                fontSize: 18,
-                fontWeight: FontWeight.w600,
-                color: const Color(0xFF4A1818),
-              ),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  "Exercises",
+                  style: GoogleFonts.poppins(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                    color: const Color(0xFF4A1818),
+                  ),
+                ),
+                if (_isWorkoutActive)
+                  TextButton.icon(
+                    onPressed: _markAllExercisesComplete,
+                    icon: const Icon(Icons.check_circle, size: 16),
+                    label: const Text("Mark All Complete"),
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.green,
+                    ),
+                  ),
+              ],
             ),
             const SizedBox(height: 15),
             Container(
@@ -665,17 +1039,87 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                           textAlign: TextAlign.center,
                         ),
                       ),
+                      if (_isWorkoutActive)
+                        Expanded(
+                          child: Text(
+                            "Complete",
+                            style: GoogleFonts.poppins(fontWeight: FontWeight.bold),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
                     ],
                   ),
                   const SizedBox(height: 15),
-                  ..._activeWorkout!.exercises.map((exercise) => _buildExerciseRow(exercise)),
+                  ..._activeWorkout!.exercises.asMap().entries.map((entry) => 
+                    _buildExerciseRow(entry.value, entry.key)),
+                ],
+              ),
+            ),
+          ],
+          
+          // Select Workout Plan Section (when no active workout)
+          if (_activeWorkout == null && _workoutPlans.isNotEmpty) ...[
+            const SizedBox(height: 20),
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.05),
+                    blurRadius: 10,
+                    offset: const Offset(0, 5),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "Select a Workout Plan",
+                    style: GoogleFonts.poppins(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  ..._workoutPlans.take(3).map((plan) => ListTile(
+                    leading: Icon(
+                      plan.isActive ? Icons.check_circle : Icons.fitness_center,
+                      color: plan.isActive ? Colors.green : const Color(0xFF9E1818),
+                    ),
+                    title: Text(plan.name),
+                    subtitle: Text("${plan.exercises.length} exercises"),
+                    trailing: ElevatedButton(
+                      onPressed: () => _setActivePlan(plan),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF9E1818),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      ),
+                      child: const Text("Select"),
+                    ),
+                    onTap: () => _setActivePlan(plan),
+                  )),
+                  if (_workoutPlans.length > 3)
+                    Center(
+                      child: TextButton(
+                        onPressed: () {
+                          setState(() {
+                            _selectedTab = 1; // Switch to Plans tab
+                          });
+                        },
+                        child: const Text("View All Plans"),
+                      ),
+                    ),
                 ],
               ),
             ),
           ],
           
           // Create New Workout Button
-          if (_activeWorkout == null) ...[
+          if (_workoutPlans.isEmpty) ...[
             const SizedBox(height: 30),
             Container(
               padding: const EdgeInsets.all(30),
@@ -698,48 +1142,48 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                       Icons.fitness_center,
                       size: 60,
                       color: Colors.grey.shade300,
-                  ),
-                  const SizedBox(height: 20),
-                  Text(
-                    "No Workout Plan Set",
-                    style: GoogleFonts.poppins(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                      color: const Color(0xFF4A1818),
                     ),
-                  ),
-                  const SizedBox(height: 10),
-                  Text(
-                    "Create your first workout plan to get started",
-                    style: GoogleFonts.poppins(
-                      fontSize: 14,
-                      color: Colors.grey.shade600,
-                    ),
-                    textAlign: TextAlign.center,
-                  ),
-                  const SizedBox(height: 20),
-                  ElevatedButton(
-                    onPressed: _createNewWorkoutPlan,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF9E1818),
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 15),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                    ),
-                    child: Text(
-                      "Create Workout Plan",
+                    const SizedBox(height: 20),
+                    Text(
+                      "No Workout Plan Set",
                       style: GoogleFonts.poppins(
-                        fontSize: 16,
+                        fontSize: 18,
                         fontWeight: FontWeight.w600,
+                        color: const Color(0xFF4A1818),
                       ),
                     ),
-                  ),
-                ],
+                    const SizedBox(height: 10),
+                    Text(
+                      "Create your first workout plan to get started",
+                      style: GoogleFonts.poppins(
+                        fontSize: 14,
+                        color: Colors.grey.shade600,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 20),
+                    ElevatedButton(
+                      onPressed: _createNewWorkoutPlan,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF9E1818),
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 15),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      child: Text(
+                        "Create Workout Plan",
+                        style: GoogleFonts.poppins(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
-            )
           ],
           
           const SizedBox(height: 30),
@@ -748,7 +1192,9 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
     );
   }
 
-  Widget _buildExerciseRow(Exercise exercise) {
+  Widget _buildExerciseRow(Exercise exercise, int index) {
+    final isCompleted = _exerciseCompletion[index] ?? false;
+    
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10),
       child: Row(
@@ -756,12 +1202,26 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
         children: [
           Expanded(
             flex: 2,
-            child: Text(
-              exercise.name,
-              style: GoogleFonts.poppins(
-                fontSize: 14,
-                fontWeight: FontWeight.w500,
-              ),
+            child: Row(
+              children: [
+                if (_isWorkoutActive)
+                  Checkbox(
+                    value: isCompleted,
+                    onChanged: (value) => _markExerciseComplete(index, value ?? false),
+                    activeColor: Colors.green,
+                  ),
+                Expanded(
+                  child: Text(
+                    exercise.name,
+                    style: GoogleFonts.poppins(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      decoration: isCompleted ? TextDecoration.lineThrough : null,
+                      color: isCompleted ? Colors.grey : null,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
           Expanded(
@@ -769,6 +1229,8 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
               "${exercise.sets}",
               style: GoogleFonts.poppins(
                 fontSize: 14,
+                decoration: isCompleted ? TextDecoration.lineThrough : null,
+                color: isCompleted ? Colors.grey : null,
               ),
               textAlign: TextAlign.center,
             ),
@@ -778,6 +1240,8 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
               "${exercise.reps}",
               style: GoogleFonts.poppins(
                 fontSize: 14,
+                decoration: isCompleted ? TextDecoration.lineThrough : null,
+                color: isCompleted ? Colors.grey : null,
               ),
               textAlign: TextAlign.center,
             ),
@@ -787,10 +1251,20 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
               "${exercise.duration}s",
               style: GoogleFonts.poppins(
                 fontSize: 14,
+                decoration: isCompleted ? TextDecoration.lineThrough : null,
+                color: isCompleted ? Colors.grey : null,
               ),
               textAlign: TextAlign.center,
             ),
           ),
+          if (_isWorkoutActive)
+            Expanded(
+              child: Icon(
+                isCompleted ? Icons.check_circle : Icons.radio_button_unchecked,
+                color: isCompleted ? Colors.green : Colors.grey,
+                size: 20,
+              ),
+            ),
         ],
       ),
     );
@@ -893,11 +1367,15 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                plan.name,
-                style: GoogleFonts.poppins(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w600,
+              Expanded(
+                child: Text(
+                  plan.name,
+                  style: GoogleFonts.poppins(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
               Row(
@@ -924,17 +1402,7 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                       _activeWorkout?.id == plan.id ? Icons.check_circle : Icons.radio_button_unchecked,
                       color: _activeWorkout?.id == plan.id ? const Color(0xFF9E1818) : Colors.grey,
                     ),
-                    onPressed: () {
-                      setState(() {
-                        _activeWorkout = plan;
-                      });
-                      // Update active status in Firestore
-                      for (final p in _workoutPlans) {
-                        firestore.collection('workout_plans').doc(p.id).update({
-                          'isActive': p.id == plan.id,
-                        });
-                      }
-                    },
+                    onPressed: () => _setActivePlan(plan),
                   ),
                 ],
               ),
@@ -965,23 +1433,37 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                 ),
               ),
               const Spacer(),
+              // Complete Button for Plans Tab
+              ElevatedButton.icon(
+                onPressed: () {
+                  _setActivePlan(plan);
+                  setState(() {
+                    _selectedTab = 0; // Switch to Today tab
+                  });
+                },
+                icon: const Icon(Icons.play_arrow, size: 16),
+                label: const Text("Start"),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF9E1818),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                ),
+              ),
+              const SizedBox(width: 10),
               IconButton(
                 icon: const Icon(Icons.add, size: 20, color: Color(0xFF9E1818)),
                 onPressed: () => _addExerciseToPlan(plan.id),
               ),
               IconButton(
                 icon: const Icon(Icons.delete, size: 20, color: Colors.red),
-                onPressed: () async {
-                  await firestore.collection('workout_plans').doc(plan.id).delete();
-                  await _loadWorkoutData();
-                },
+                onPressed: () => _deleteWorkoutPlan(plan.id),
               ),
             ],
           ),
           
           if (plan.exercises.isNotEmpty) ...[
             const SizedBox(height: 15),
-            ...plan.exercises.take(3).map((exercise) => Padding(
+            ...plan.exercises.asMap().entries.map((entry) => Padding(
               padding: const EdgeInsets.symmetric(vertical: 4),
               child: Row(
                 children: [
@@ -996,26 +1478,23 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      "${exercise.name} - ${exercise.sets} sets x ${exercise.reps} reps",
+                      "${entry.value.name} - ${entry.value.sets} sets x ${entry.value.reps} reps",
                       style: GoogleFonts.poppins(
                         fontSize: 14,
                       ),
                     ),
                   ),
+                  IconButton(
+                    icon: const Icon(Icons.edit, size: 16, color: Colors.blue),
+                    onPressed: () => _editExercise(plan.id, entry.value, entry.key),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.delete, size: 16, color: Colors.red),
+                    onPressed: () => _deleteExercise(plan.id, entry.key),
+                  ),
                 ],
               ),
             )),
-            if (plan.exercises.length > 3)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text(
-                  "+${plan.exercises.length - 3} more exercises",
-                  style: GoogleFonts.poppins(
-                    fontSize: 12,
-                    color: Colors.grey,
-                  ),
-                ),
-              ),
           ],
         ],
       ),
@@ -1089,6 +1568,10 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
   }
 
   Widget _buildHistoryCard(WorkoutSession session) {
+    final completedExercises = session.exercises.where((e) => e.completed).length;
+    final totalExercises = session.exercises.length;
+    final completionPercentage = totalExercises > 0 ? completedExercises / totalExercises : 0.0;
+
     return Container(
       margin: const EdgeInsets.only(bottom: 15),
       padding: const EdgeInsets.all(20),
@@ -1109,11 +1592,13 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                session.workoutPlanName,
-                style: GoogleFonts.poppins(
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
+              Expanded(
+                child: Text(
+                  session.workoutPlanName,
+                  style: GoogleFonts.poppins(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
               Container(
@@ -1157,13 +1642,13 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
                 ),
               ),
               const SizedBox(width: 20),
-              Icon(Icons.list, size: 16, color: Colors.grey.shade600),
+              Icon(Icons.check_circle, size: 16, color: Colors.green),
               const SizedBox(width: 6),
               Text(
-                "${session.exercises.length} exercises",
+                "${(completionPercentage * 100).toStringAsFixed(0)}%",
                 style: GoogleFonts.poppins(
                   fontSize: 14,
-                  color: Colors.grey.shade600,
+                  color: Colors.green,
                 ),
               ),
             ],
@@ -1171,29 +1656,55 @@ class _WorkoutManagementSectionState extends State<WorkoutManagementSection> {
           
           if (session.exercises.isNotEmpty) ...[
             const SizedBox(height: 15),
+            LinearProgressIndicator(
+              value: completionPercentage,
+              backgroundColor: Colors.grey.shade200,
+              valueColor: AlwaysStoppedAnimation<Color>(
+                completionPercentage > 0.7 ? Colors.green : const Color(0xFF9E1818),
+              ),
+              minHeight: 6,
+            ),
+            const SizedBox(height: 10),
             Wrap(
               spacing: 8,
               runSpacing: 8,
-              children: session.exercises.take(4).map((exercise) => Container(
+              children: session.exercises.take(3).map((exercise) => Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                 decoration: BoxDecoration(
-                  color: Colors.grey.shade100,
+                  color: exercise.completed 
+                    ? Colors.green.withOpacity(0.1)
+                    : Colors.grey.shade100,
                   borderRadius: BorderRadius.circular(10),
-                ),
-                child: Text(
-                  exercise.name,
-                  style: GoogleFonts.poppins(
-                    fontSize: 12,
-                    color: Colors.grey.shade700,
+                  border: Border.all(
+                    color: exercise.completed ? Colors.green : Colors.transparent,
+                    width: 1,
                   ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      exercise.completed ? Icons.check_circle : Icons.play_circle,
+                      size: 12,
+                      color: exercise.completed ? Colors.green : Colors.grey.shade600,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      exercise.name,
+                      style: GoogleFonts.poppins(
+                        fontSize: 12,
+                        color: exercise.completed ? Colors.green : Colors.grey.shade700,
+                      ),
+                    ),
+                  ],
                 ),
               )).toList(),
             ),
-            if (session.exercises.length > 4)
+            if (session.exercises.length > 3)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: Text(
-                  "+${session.exercises.length - 4} more exercises",
+                  "+${session.exercises.length - 3} more exercises",
                   style: GoogleFonts.poppins(
                     fontSize: 12,
                     color: Colors.grey,
@@ -1247,11 +1758,11 @@ class WorkoutPlan {
 }
 
 class Exercise {
-  final String name;
-  final int sets;
-  final int reps;
-  final int duration; // in seconds
-  final bool completed;
+  String name;
+  int sets;
+  int reps;
+  int duration; // in seconds
+  bool completed;
 
   Exercise({
     required this.name,
@@ -1283,34 +1794,40 @@ class Exercise {
 }
 
 class WorkoutSession {
+  final String id;
   final String workoutPlanId;
   final String workoutPlanName;
   final String date;
   final int duration; // in seconds
   final int caloriesBurned;
   final List<Exercise> exercises;
+  final bool isCompleted;
 
   WorkoutSession({
+    required this.id,
     required this.workoutPlanId,
     required this.workoutPlanName,
     required this.date,
     required this.duration,
     required this.caloriesBurned,
     required this.exercises,
+    this.isCompleted = false,
   });
 
-  factory WorkoutSession.fromMap(Map<String, dynamic> data) {
+  factory WorkoutSession.fromMap(Map<String, dynamic> data, String id) {
     final exercises = (data['exercises'] as List<dynamic>? ?? []).map((e) {
       return Exercise.fromMap(e);
     }).toList();
 
     return WorkoutSession(
+      id: id,
       workoutPlanId: data['workoutPlanId'] ?? '',
       workoutPlanName: data['workoutPlanName'] ?? 'Unknown Workout',
       date: data['date'] ?? '',
       duration: data['duration'] ?? 0,
       caloriesBurned: data['caloriesBurned'] ?? 0,
       exercises: exercises,
+      isCompleted: data['completed'] ?? false,
     );
   }
 }
